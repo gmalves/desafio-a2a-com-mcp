@@ -1,0 +1,8 @@
+[project]
+name = "agente-a2a-central-de-salas"
+version = "1.0.0"
+description = "Agente A2A (v1.0, JSON-RPC) com host MCP por dentro — desafio A Ponte"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp==2.3.0",
+]

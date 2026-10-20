@@ -1,0 +1,3 @@
+# Dependencias do desafio A Ponte (versoes travadas).
+# O SDK oficial do MCP cobre o servidor (Streamable HTTP) e o cliente (host MCP).
+mcp==2.3.0
