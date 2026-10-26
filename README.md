@@ -41,7 +41,7 @@ A ponte é a costura entre o `input_required` do MRTR do MCP e a Task do A2A —
 
 1. **No servidor MCP** (`servidor-mcp/servidor.py`), o resolver `escolha_de_sala` roda antes do corpo da tool `reservar_sala`. Quando o intervalo está ocupado e há alternativas, ele devolve um `Elicit(...)` (elicitation em form mode, com o enum das salas alternativas na ordem da regra) e o framework **encerra a resposta** com `resultType: "input_required"` — o servidor não inicia request, ele termina a resposta pedindo informação. O `requestState` (com o pedido original selado) é produzido na borda e o servidor **não guarda nada em memória** entre o `input_required` e o retry.
 2. **No agente** (`agente/agente.py`, função `_pausar`): o `input_required` chega **cru** (o cliente MCP usa `allow_input_required=True`; nunca há callback de elicitation respondendo sozinho). O agente coloca a Task em `TASK_STATE_INPUT_REQUIRED` com a linha exata `alternativas: <ids>` e guarda o `requestState` **ligado àquela Task** — opaco, nunca exposto no card, no artifact nem em mensagem ao cliente A2A.
-3. **Na retomada** (`agente/agente.py`, função `_continuar_task`): o `SendMessage` de continuação (`escolha=<sala>` ou `escolha=recusar`) repete o `tools/call` original com um **id de JSON-RPC novo** (cada chamada cunha um id próprio), levando `inputResponses` com a **mesma chave** que veio no `inputRequests` e o `requestState` ecoado **sem modificação**. O servidor verifica a integridade na borda, reconstrói o pedido a partir do próprio `requestState` e conclui a reserva.
+3. **Na retomada** (`agente/agente.py`, função `_continuar_task`): o `SendMessage` de continuação (`escolha=<sala>` ou `escolha=recusar`) repete o `tools/call` original com um **id de JSON-RPC novo**, cunhado pelo agente numa sequência única do processo (`_DispatcherComIdsProprios` → `CallOptions["request_id"]`) — nunca o mesmo id do request inicial, nem quando a conexão MCP é recriada (o caso de cada mensagem A2A) nem depois de restart do servidor MCP. Vai junto o `inputResponses` com a **mesma chave** que veio no `inputRequests` e o `requestState` ecoado **sem modificação**. O servidor verifica a integridade na borda, reconstrói o pedido a partir do próprio `requestState` e conclui a reserva.
 
 ## Decisões técnicas
 
@@ -49,17 +49,18 @@ A ponte é a costura entre o `input_required` do MRTR do MCP e a Task do A2A —
 - **Integridade das rodadas:** o framework sela/verifica o envelope a cada rodada, com binding ao método, ao nome da tool e ao digest dos argumentos — um retry com argumentos divergentes do pedido selado é recusado na borda (a divergência não toma efeito).
 - **Estado das Tasks:** em memória, no processo do agente (`dict` + lock). O estado pausado é **por Task**: cada Task carrega o seu próprio `requestState`, então duas pausas simultâneas não se misturam. Reservas vivem em memória no servidor MCP (não sobrevivem a restart; o `requestState` sim).
 - **Cliente MCP por request:** o agente abre uma conexão Streamable HTTP por mensagem A2A e sempre faz `tools/list` antes do primeiro `tools/call` (descoberta em runtime — sem lista fixa no código) e lê o resource `politica://uso` para extrair a versão. O `_meta` de cada request carrega `protocolVersion`, `clientInfo`, `clientCapabilities` (incluindo `elicitation.form`) e o `traceparent` propagado do cliente A2A (mesmo trace-id, span novo).
+- **Id do retry:** o `id` de JSON-RPC de um request é responsabilidade do cliente, e o dispatcher do SDK numera **por sessão** (`server/discover=1`, `tools/list=2`, `resources/read=3`, `tools/call=4`). Como a sessão é nova a cada mensagem A2A, deixar o dispatcher numerar faria o `tools/call` do retry cair de novo no id 4 do request inicial. O agente cunha o id de cada `tools/call` (`_DispatcherComIdsProprios`, um decorator sobre o dispatcher da sessão que injeta `CallOptions["request_id"]` — o id que o dispatcher honra verbatim e mantém fora do contador dele) a partir de uma sequência única do processo, começando em 4 para o log ficar na mesma leitura de uma sessão contínua. Verificado: request inicial `id=4` → retry `id=5`; e, com o servidor MCP reiniciado no meio da reserva, `id=6` → `id=7`.
 - **Capability de elicitation:** declarada via callback de elicitation registrado no cliente MCP — que nunca responde pelo cliente A2A, porque o fluxo consome o `input_required` cru.
 - **Recusa:** `escolha=recusar` vira `action: "decline"`; o servidor conclui sem reservar (`reservado: false` + `motivo`, sem `isError`) e a Task termina em `TASK_STATE_CANCELED`.
 - **Determinismo:** pedido em formato fixo (`reservar sala=... inicio=... fim=... responsavel=...`), decisão por regra. Alternativas: salas livres no intervalo com capacidade ≥ a pedida, no máximo 3, ordenadas por capacidade crescente e `id` alfabético em empate.
-- **Log no stderr:** um middleware registra cada request recebido com método, id e `traceparent` (quando vem no `_meta`) — é o instrumento de depuração do avaliador.
+- **Log no stderr:** um middleware registra cada request recebido com método, id e `traceparent` (quando vem no `_meta`) — é o instrumento de depuração do avaliador. O agente também registra no próprio stderr o método e o id de cada `tools/call` que envia, então o par request inicial/retry se confere num só lugar.
 
 ## Saída do validador
 
 Última execução (processos recém-iniciados), **exit code 0**:
 
 ```text
-trace-id desta execucao: 852f8ee2872d980268f15e82bf110776
+trace-id desta execucao: e6fdc8f9551133a78e065e4730eb48fb
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools
@@ -103,7 +104,12 @@ PASS 36 o agente e deterministico: o mesmo pedido produz a mesma pausa
 resumo: 36 passaram, 0 falharam, de 36 verificacoes
 ```
 
-Nos logs do servidor MCP (stderr) dá para conferir o roteiro completo: o `tools/list` do agente antes do primeiro `tools/call`, o `traceparent` com o trace-id impresso pelo validador, e o par de `tools/call` de uma reserva que passou pela pausa — o retry com id diferente do request inicial.
+Nos logs do servidor MCP (stderr) dá para conferir o roteiro completo: o `tools/list` do agente antes do primeiro `tools/call`, o `traceparent` com o trace-id impresso pelo validador, e o par de `tools/call` de uma reserva que passou pela pausa — o request inicial com um id e o retry com o id seguinte (`id=4` e `id=5` no primeiro par do processo), diferente do inicial. O mesmo par aparece no stderr do agente:
+
+```text
+[agente] request method=tools/call id=4
+[agente] request method=tools/call id=5
+```
 
 ## Estrutura do repositório
 

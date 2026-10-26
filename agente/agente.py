@@ -11,8 +11,10 @@ Desafio "A Ponte" - as duas pontas:
 - A PONTE: ao receber input_required do MCP, a Task vai para
   TASK_STATE_INPUT_REQUIRED com a linha "alternativas: ...", o requestState
   fica guardado (opaco, ligado a Task e nunca exposto) e a continuacao
-  "escolha=<sala>" repete o tools/call com id novo, devolvendo inputResponses
-  com a MESMA chave e o requestState ecoado sem modificacao.
+  "escolha=<sala>" repete o tools/call com id de JSON-RPC NOVO - o agente cunha
+  o id de cada tools/call (_DispatcherComIdsProprios), entao o retry nunca
+  repete o id do request inicial, devolvendo inputResponses com a MESMA chave e
+  o requestState ecoado sem modificacao.
 
 Sem LLM no caminho de execucao: o pedido chega em formato fixo e a decisao e
 por regra. Determinismo garantido.
@@ -42,6 +44,66 @@ ESTADOS_TERMINAIS = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_
 
 def _novo_id(prefixo: str) -> str:
     return f"{prefixo}-{secrets.token_hex(6)}"
+
+
+_ID_DE_CHAMADA = 4
+"""Proximo id de JSON-RPC do tools/call (sequencia unica do processo).
+
+O primeiro tools/call de uma sessao nova e o quarto request (server/discover=1,
+tools/list=2, resources/read=3, tools/call=4): comecar em 4 mantem o log igual ao
+de um cliente que continua contando uma sessao so.
+"""
+_TRAVA_CHAMADAS = threading.Lock()
+
+
+def _proximo_id_de_chamada() -> int:
+    """Cunha o id do proximo tools/call.
+
+    O retry precisa sair com um id de JSON-RPC diferente do request original.
+    Como o agente abre uma conexao por mensagem A2A, a contagem do dispatcher
+    recomeca a cada mensagem e o tools/call cairia sempre no mesmo id; a
+    sequencia unica do processo garante o id novo em qualquer ordem de conexoes.
+    """
+    global _ID_DE_CHAMADA
+    with _TRAVA_CHAMADAS:
+        id_chamada = _ID_DE_CHAMADA
+        _ID_DE_CHAMADA += 1
+        return id_chamada
+
+
+class _DispatcherComIdsProprios:
+    """Dispatcher decorator: todo tools/call sai com um id cunhado pelo agente.
+
+    O dispatcher do SDK numera os requests por sessao (server/discover=1,
+    tools/list=2, resources/read=3, tools/call=4), entao uma conexao nova por
+    mensagem A2A faria o retry reusar o id=4 do request inicial da mesma reserva.
+    O decorator injeta CallOptions["request_id"] - o id que o caller cunha e que o
+    dispatcher honra verbatim, mantendo-o fora do proprio contador - com um valor
+    da sequencia do processo. O resto do dispatcher (run/notify/estado) passa
+    direto: os requests que nao sao tools/call seguem com o id da sessao.
+    """
+
+    def __init__(self, interno: Any) -> None:
+        self._interno = interno
+
+    def __getattr__(self, nome: str) -> Any:
+        return getattr(self._interno, nome)
+
+    async def send_raw_request(
+        self, metodo: str, params: Any, opts: Any = None, **extra: Any
+    ) -> dict[str, Any]:
+        if metodo == "tools/call":
+            opts = dict(opts or {})
+            opts.setdefault("request_id", _proximo_id_de_chamada())
+            print(
+                f"[agente] request method={metodo} id={opts['request_id']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return await self._interno.send_raw_request(metodo, params, opts, **extra)
+
+    async def notify(self, metodo: str, params: Any, opts: Any = None, **extra: Any) -> None:
+        return await self._interno.notify(metodo, params, opts, **extra)
 
 
 def _card() -> dict[str, Any]:
@@ -156,8 +218,8 @@ async def _chamar_reservar(
 
     Descobre por tools/list, le o resource da politica e chama reservar_sala com
     o input_required CRU (allow_input_required=True). No retry, repete o
-    tools/call com id de JSON-RPC novo (cada call_tool cunha um id proprio),
-    inputResponses e o requestState ecoado sem modificacao.
+    tools/call com id de JSON-RPC novo (cunhado pelo agente, nunca o mesmo do
+    request inicial), inputResponses e o requestState ecoado sem modificacao.
     """
     meta = _trace_meta(traceparent, fallback_trace)
     async with Client(
@@ -166,6 +228,16 @@ async def _chamar_reservar(
         elicitation_callback=_elicitation_nao_usada,
     ) as client:
         sessao = client.session
+        # O dispatcher do SDK aceita o id de JSON-RPC cunhado pelo caller
+        # (CallOptions["request_id"]), mas o caminho tipado nao expoe a opcao;
+        # sem isto o tools/call sairia sempre com o id que a contagem da sessao
+        # nova alcanca (4) e o retry repetiria o id do request inicial.
+        # O decorator cobre a parte do protocolo que a sessao usa no outbound
+        # (send_raw_request/notify); o resto (run, estado) delega por __getattr__,
+        # o que o checador estatico nao enxerga.
+        sessao._dispatcher = _DispatcherComIdsProprios(  # pyright: ignore[reportAttributeAccessIssue]
+            sessao._dispatcher
+        )
         descoberta = await sessao.list_tools()
         nomes = {t.name for t in descoberta.tools}
         if "reservar_sala" not in nomes:
