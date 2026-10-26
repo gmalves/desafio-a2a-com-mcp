@@ -58,10 +58,10 @@ A ponte é a costura entre o `input_required` do MRTR do MCP e a Task do A2A —
 
 ## Saída do validador
 
-Última execução (processos recém-iniciados), **exit code 0**:
+Última execução (a partir de um clone limpo do repositório, processos recém-iniciados), **exit code 0**:
 
 ```text
-trace-id desta execucao: e6fdc8f9551133a78e065e4730eb48fb
+trace-id desta execucao: 05da4362bc1d971e6cb51dbc5ed3ca4e
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools
@@ -105,11 +105,18 @@ PASS 36 o agente e deterministico: o mesmo pedido produz a mesma pausa
 resumo: 36 passaram, 0 falharam, de 36 verificacoes
 ```
 
-Nos logs do servidor MCP (stderr) dá para conferir o roteiro completo: o `tools/list` do agente antes do primeiro `tools/call`, o `traceparent` com o trace-id impresso pelo validador, e o par de `tools/call` de uma reserva que passou pela pausa — o request inicial com um id e o retry com o id seguinte (`id=4` e `id=5` no primeiro par do processo), diferente do inicial. O mesmo par aparece no stderr do agente:
+Nos logs do servidor MCP (stderr) dá para conferir o roteiro completo: os três requests de cada mensagem A2A com o mesmo trace-id que o validador imprimiu (`tools/list` antes do primeiro `tools/call`), e o par de `tools/call` de uma reserva que passou pela pausa — o request inicial e o retry com ids diferentes. O mesmo par aparece no stderr do agente:
 
 ```text
-[agente] request method=tools/call id=4
-[agente] request method=tools/call id=5
+[central-de-salas] request method=tools/list id=1 traceparent=00-<trace-id>-...-01
+[central-de-salas] request method=resources/read id=2 traceparent=00-<trace-id>-...-01
+[central-de-salas] request method=tools/call id=16 traceparent=00-<trace-id>-...-01     <- request inicial da reserva
+[central-de-salas] request method=tools/list id=1 traceparent=00-<trace-id>-...-01
+[central-de-salas] request method=resources/read id=2 traceparent=00-<trace-id>-...-01
+[central-de-salas] request method=tools/call id=17 traceparent=00-<trace-id>-...-01     <- retry, id novo
+
+[agente] request method=tools/call id=16
+[agente] request method=tools/call id=17
 ```
 
 ## Estrutura do repositório
