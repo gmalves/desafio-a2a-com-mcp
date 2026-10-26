@@ -5,16 +5,18 @@ Desafio "A Ponte" - as duas pontas:
 
 - POR DENTRO (host MCP): descobre as tools por tools/list, le o resource
   politica://uso, chama reservar_sala por HTTP como cliente MCP de verdade, e
-  ENXERGA o input_required cru (nunca responde a elicitation sozinho);
+  ENXERGA o input_required cru (nunca responde a elicitation sozinho). Todo
+  request da Task leva os campos obrigatorios de _meta, a capability de
+  elicitation em form mode e o traceparent do cliente A2A;
 - POR FORA (servidor A2A v1.0, binding JSON-RPC): Agent Card no well-known,
   SendMessage e GetTask, Task com identidade/estado/produto;
 - A PONTE: ao receber input_required do MCP, a Task vai para
   TASK_STATE_INPUT_REQUIRED com a linha "alternativas: ...", o requestState
   fica guardado (opaco, ligado a Task e nunca exposto) e a continuacao
   "escolha=<sala>" repete o tools/call com id de JSON-RPC NOVO - o agente cunha
-  o id de cada tools/call (_DispatcherComIdsProprios), entao o retry nunca
-  repete o id do request inicial, devolvendo inputResponses com a MESMA chave e
-  o requestState ecoado sem modificacao.
+  o id de cada tools/call (_DispatcherDoAgente), entao o retry nunca repete o id
+  do request inicial, devolvendo inputResponses com a MESMA chave e o
+  requestState ecoado sem modificacao.
 
 Sem LLM no caminho de execucao: o pedido chega em formato fixo e a decisao e
 por regra. Determinismo garantido.
@@ -32,12 +34,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mcp import Client
-from mcp_types import ElicitResult, Implementation, InputRequiredResult
+from mcp_types import (
+    ElicitResult,
+    Implementation,
+    InputRequiredResult,
+    PaginatedRequestParams,
+    RequestParamsMeta,
+)
+from mcp_types.version import LATEST_MODERN_VERSION
 
 MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:7301/mcp")
 PORTA = int(os.environ.get("AGENT_PORT", "7300"))
 
 CLIENT_INFO = Implementation(name="agente-central-de-salas", version="1.0.0")
+
+REVISAO_MCP = LATEST_MODERN_VERSION
+"""Revisao da spec que o agente fala ('2026-07-28' no mcp==2.3.0).
+
+O agente declara a versao no _meta e no header de cada request, entao fixar a
+revisao no Client dispensa o probe server/discover: a sessao ja nasce moderna e
+todos os requests daquela Task saem no mesmo formato, com o traceparent no _meta
+(o handshake por conexao nao teria como ser carimbado pelo agente).
+"""
+
+CHAVE_CAPACIDADES = "io.modelcontextprotocol/clientCapabilities"
 
 ESTADOS_TERMINAIS = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"}
 
@@ -46,12 +66,12 @@ def _novo_id(prefixo: str) -> str:
     return f"{prefixo}-{secrets.token_hex(6)}"
 
 
-_ID_DE_CHAMADA = 4
+_ID_DE_CHAMADA = 3
 """Proximo id de JSON-RPC do tools/call (sequencia unica do processo).
 
-O primeiro tools/call de uma sessao nova e o quarto request (server/discover=1,
-tools/list=2, resources/read=3, tools/call=4): comecar em 4 mantem o log igual ao
-de um cliente que continua contando uma sessao so.
+O primeiro tools/call de uma sessao nova e o terceiro request (tools/list=1,
+resources/read=2, tools/call=3): comecar em 3 mantem o log igual ao de um cliente
+que continua contando uma sessao so.
 """
 _TRAVA_CHAMADAS = threading.Lock()
 
@@ -71,16 +91,26 @@ def _proximo_id_de_chamada() -> int:
         return id_chamada
 
 
-class _DispatcherComIdsProprios:
-    """Dispatcher decorator: todo tools/call sai com um id cunhado pelo agente.
+class _DispatcherDoAgente:
+    """Dispatcher decorator: normaliza os requests que o agente emite.
 
-    O dispatcher do SDK numera os requests por sessao (server/discover=1,
-    tools/list=2, resources/read=3, tools/call=4), entao uma conexao nova por
-    mensagem A2A faria o retry reusar o id=4 do request inicial da mesma reserva.
-    O decorator injeta CallOptions["request_id"] - o id que o caller cunha e que o
-    dispatcher honra verbatim, mantendo-o fora do proprio contador - com um valor
-    da sequencia do processo. O resto do dispatcher (run/notify/estado) passa
-    direto: os requests que nao sao tools/call seguem com o id da sessao.
+    Tres ajustes, todos no outbound do cliente e nenhum no protocolo:
+
+    1. ID: todo tools/call sai com um id de JSON-RPC cunhado pelo agente
+       (sequencia unica do processo). O dispatcher do SDK numera por sessao, e
+       como o agente abre uma conexao por mensagem A2A, o retry cairia de novo no
+       id do request inicial. O id vai em CallOptions["request_id"] - o caller
+       cunha e o dispatcher honra verbatim, mantendo-o fora do proprio contador.
+    2. CAPABILITY: a elicitation declarada e a de form mode, na forma
+       {"elicitation": {"form": {}}}. O SDK declara form e url juntas sempre que
+       um callback de elicitation e registrado (ClientSession._build_capabilities),
+       mas o agente nunca responde elicitation sozinho: declarar url seria
+       anunciar o que ele nao implementa.
+    3. LOG: o agente registra no stderr o metodo e o id de cada tools/call, para
+       o par request inicial/retry se conferir sem abrir o servidor MCP.
+
+    O resto do dispatcher (run/notify/estado) passa direto por __getattr__; os
+    requests que nao sao tools/call seguem com o id da sessao.
     """
 
     def __init__(self, interno: Any) -> None:
@@ -92,6 +122,8 @@ class _DispatcherComIdsProprios:
     async def send_raw_request(
         self, metodo: str, params: Any, opts: Any = None, **extra: Any
     ) -> dict[str, Any]:
+        if isinstance(params, dict):
+            _declarar_elicitation_form(params)
         if metodo == "tools/call":
             opts = dict(opts or {})
             opts.setdefault("request_id", _proximo_id_de_chamada())
@@ -104,6 +136,16 @@ class _DispatcherComIdsProprios:
 
     async def notify(self, metodo: str, params: Any, opts: Any = None, **extra: Any) -> None:
         return await self._interno.notify(metodo, params, opts, **extra)
+
+
+def _declarar_elicitation_form(params: dict[str, Any]) -> None:
+    """Deixa a capability declarada com a elicitation em form mode e nada mais."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return
+    capacidades = meta.get(CHAVE_CAPACIDADES)
+    if isinstance(capacidades, dict) and "elicitation" in capacidades:
+        meta[CHAVE_CAPACIDADES] = {**capacidades, "elicitation": {"form": {}}}
 
 
 def _card() -> dict[str, Any]:
@@ -184,7 +226,7 @@ TAREFAS: dict[str, Task] = {}
 TRAVA = threading.Lock()
 
 
-def _trace_meta(traceparent: str | None, fallback_trace: str | None = None) -> dict[str, Any] | None:
+def _trace_meta(traceparent: str | None, fallback_trace: str | None = None) -> RequestParamsMeta | None:
     """Mesmo trace-id do cliente A2A; span-id pode ser novo (spec M6)."""
     trace_id = None
     if traceparent:
@@ -217,32 +259,32 @@ async def _chamar_reservar(
     """Fala com o servidor MCP como cliente MCP de verdade.
 
     Descobre por tools/list, le o resource da politica e chama reservar_sala com
-    o input_required CRU (allow_input_required=True). No retry, repete o
-    tools/call com id de JSON-RPC novo (cunhado pelo agente, nunca o mesmo do
-    request inicial), inputResponses e o requestState ecoado sem modificacao.
+    o input_required CRU (allow_input_required=True). Os tres requests da Task
+    (tools/list, resources/read e tools/call) levam os campos obrigatorios de
+    _meta e o traceparent do cliente A2A. No retry, repete o tools/call com id de
+    JSON-RPC novo (cunhado pelo agente, nunca o mesmo do request inicial),
+    inputResponses e o requestState ecoado sem modificacao.
     """
     meta = _trace_meta(traceparent, fallback_trace)
     async with Client(
         MCP_URL,
+        mode=REVISAO_MCP,
         client_info=CLIENT_INFO,
         elicitation_callback=_elicitation_nao_usada,
     ) as client:
         sessao = client.session
-        # O dispatcher do SDK aceita o id de JSON-RPC cunhado pelo caller
-        # (CallOptions["request_id"]), mas o caminho tipado nao expoe a opcao;
-        # sem isto o tools/call sairia sempre com o id que a contagem da sessao
-        # nova alcanca (4) e o retry repetiria o id do request inicial.
+        # Ajustes do agente no outbound do cliente (ids e capability declarada).
         # O decorator cobre a parte do protocolo que a sessao usa no outbound
         # (send_raw_request/notify); o resto (run, estado) delega por __getattr__,
         # o que o checador estatico nao enxerga.
-        sessao._dispatcher = _DispatcherComIdsProprios(  # pyright: ignore[reportAttributeAccessIssue]
+        sessao._dispatcher = _DispatcherDoAgente(  # pyright: ignore[reportAttributeAccessIssue]
             sessao._dispatcher
         )
-        descoberta = await sessao.list_tools()
+        descoberta = await sessao.list_tools(params=PaginatedRequestParams(_meta=meta))
         nomes = {t.name for t in descoberta.tools}
         if "reservar_sala" not in nomes:
             raise RuntimeError(f"tool reservar_sala ausente no servidor MCP: {sorted(nomes)}")
-        politica = await sessao.read_resource("politica://uso")
+        politica = await sessao.read_resource("politica://uso", meta=meta)
         texto_politica = "".join(c.text for c in politica.contents if getattr(c, "text", None))
         versao = texto_politica.splitlines()[0].split(":", 1)[1].strip()
         resultado = await sessao.call_tool(
@@ -333,6 +375,7 @@ def _parse_pedido(texto: str) -> dict[str, Any] | None:
 
 
 def _nova_task(mensagem: dict[str, Any], traceparent: str | None) -> Task:
+    """Abre a Task em TASK_STATE_SUBMITTED a partir do pedido em formato fixo."""
     task = Task(_novo_id("task"), _novo_id("ctx"))
     msg_id = mensagem.get("messageId") or _novo_id("msg")
     task.history.append(
@@ -350,18 +393,41 @@ def _nova_task(mensagem: dict[str, Any], traceparent: str | None) -> Task:
     task.trace_id = (
         traceparent.strip().split("-")[1] if traceparent and len(traceparent.strip().split("-")) >= 4 else None
     )
-    task.state = "TASK_STATE_WORKING"
-
-    resultado, _ = asyncio.run(_chamar_reservar(args, traceparent))
-    if isinstance(resultado, InputRequiredResult):
-        _pausar(task, resultado)
-    else:
-        _aplicar_completude(task, resultado)
-    task.add_history(task.mensagem, "ROLE_AGENT", _novo_id("msg"))
     return task
 
 
-def _continuar_task(task: Task, texto: str, traceparent: str | None) -> dict[str, Any] | None:
+def _falar_com_mcp(task: Task, traceparent: str | None, input_responses: dict[str, Any] | None = None) -> None:
+    """Leva a Task a WORKING, roda o ciclo do MCP e traduz a resposta em estado + produto.
+
+    Roda com a Task ja registrada: GetTask reflete o estado corrente no meio do
+    caminho (WORKING durante a chamada ao servidor MCP). No primeiro pedido
+    input_responses vai vazio; no retry vai o inputResponses com a mesma chave
+    que veio no inputRequests, mais o requestState guardado na Task.
+    """
+    task.state = "TASK_STATE_WORKING"
+    assert task.args is not None
+    try:
+        resultado, _ = asyncio.run(
+            _chamar_reservar(
+                task.args,
+                traceparent,
+                fallback_trace=task.trace_id,
+                input_responses=input_responses,
+                request_state=task.request_state,
+            )
+        )
+    except Exception as erro:  # noqa: BLE001 - servidor MCP fora do ar: a Task falha, nao trava
+        task.state = "TASK_STATE_FAILED"
+        task.mensagem = f"Falha ao falar com o servidor MCP: {erro}"
+    else:
+        if isinstance(resultado, InputRequiredResult):
+            _pausar(task, resultado)
+        else:
+            _aplicar_completude(task, resultado)
+    task.add_history(task.mensagem, "ROLE_AGENT", _novo_id("msg"))
+
+
+def _continuar_task(task: Task, texto: str, traceparent: str | None) -> None:
     """Continuacao "escolha=<valor>" referenciando uma Task pausada."""
     escolha = texto.strip().removeprefix("escolha=")
     task.add_history(texto, "ROLE_USER", _novo_id("msg"))
@@ -371,28 +437,14 @@ def _continuar_task(task: Task, texto: str, traceparent: str | None) -> dict[str
         task.state = "TASK_STATE_INPUT_REQUIRED"
         task.mensagem = _linha_alternativas(task.alternativas)
         task.add_history(task.mensagem, "ROLE_AGENT", _novo_id("msg"))
-        return None
+        return
 
     assert task.args is not None and task.chave is not None
     if escolha == "recusar":
         resposta = ElicitResult(action="decline")
     else:
         resposta = ElicitResult(action="accept", content={"sala": escolha})
-    resultado, _ = asyncio.run(
-        _chamar_reservar(
-            task.args,
-            traceparent,
-            fallback_trace=task.trace_id,
-            input_responses={task.chave: resposta},
-            request_state=task.request_state,
-        )
-    )
-    if isinstance(resultado, InputRequiredResult):
-        _pausar(task, resultado)
-    else:
-        _aplicar_completude(task, resultado)
-    task.add_history(task.mensagem, "ROLE_AGENT", _novo_id("msg"))
-    return None
+    _falar_com_mcp(task, traceparent, input_responses={task.chave: resposta})
 
 
 def _texto_mensagem(mensagem: dict[str, Any]) -> str:
@@ -435,7 +487,11 @@ def processar(corpo: dict[str, Any], cabecalhos: dict[str, str]) -> dict[str, An
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {"task": task.dict()}}
 
         task = _nova_task(mensagem, traceparent)
+        # Registra antes de falar com o MCP: GetTask ja enxerga a Task em
+        # SUBMITTED/WORKING enquanto a chamada esta em curso.
         TAREFAS[task.id] = task
+        if task.args is not None:
+            _falar_com_mcp(task, traceparent)
         return {"jsonrpc": "2.0", "id": rpc_id, "result": {"task": task.dict()}}
 
 
